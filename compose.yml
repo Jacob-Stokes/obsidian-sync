@@ -1,23 +1,50 @@
+# Obsidian vault infrastructure: sync + API.
+#
+# obsidian-sync: runs ob sync --continuous, keeps /vault in sync
+#                with Obsidian Sync cloud
+# obsidian-api:  Hono REST server for reading/writing vault files
+#                over HTTP, exposed via Cloudflare tunnel
+#
+# Both share a named volume (vault_data) at /vault.
+#
+# Env vars (in .env):
+#   OBSIDIAN_AUTH_TOKEN  — from `ob login`
+#   VAULT_NAME           — name of the vault in Obsidian Sync
+#   VAULT_PASSWORD       — only if vault uses e2e encryption
+#   API_KEY              — key for authenticating API requests
+
 services:
   obsidian-sync:
-    image: ghcr.io/${GHCR_REPO:-belphemur/obsidian-headless-sync-docker}:latest
+    image: ghcr.io/jacob-stokes/obsidian-sync:latest
     container_name: obsidian-sync
+    restart: unless-stopped
     environment:
-      # Required
       OBSIDIAN_AUTH_TOKEN: ${OBSIDIAN_AUTH_TOKEN}
       VAULT_NAME: ${VAULT_NAME}
-      # Required if vault uses end-to-end encryption
       VAULT_PASSWORD: ${VAULT_PASSWORD:-}
-      # File ownership: UID:GID of the host user who should own vault files.
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
-      # Optional overrides
-      VAULT_PATH: ${VAULT_PATH:-/vault}
-      DEVICE_NAME: ${DEVICE_NAME:-obsidian-docker}
-      CONFLICT_STRATEGY: ${CONFLICT_STRATEGY:-merge}
-      EXCLUDED_FOLDERS: ${EXCLUDED_FOLDERS:-}
-      FILE_TYPES: ${FILE_TYPES:-}
+      VAULT_PATH: /vault
+      DEVICE_NAME: ${DEVICE_NAME:-resolution-docker}
+      CONFLICT_STRATEGY: merge
     volumes:
-      - ${VAULT_HOST_PATH:-./vault}:/vault
-      - ${CONFIG_HOST_PATH:-./config}:/home/obsidian/.config
+      - vault_data:/vault
+      - sync_config:/home/obsidian/.config
+
+  obsidian-api:
+    image: ghcr.io/jacob-stokes/obsidian-api:latest
+    container_name: obsidian-api
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3098:3000"
+    environment:
+      - API_KEY=${API_KEY}
+      - VAULT_PATH=/vault
+    volumes:
+      - vault_data:/vault
+    depends_on:
+      - obsidian-sync
+
+volumes:
+  vault_data:
+  sync_config:
