@@ -515,6 +515,81 @@ app.post("/bulk/delete", async (c) => {
   return c.json({ count: results.length, deleted: ok, results });
 });
 
+/**
+ * Bulk read many files in one request. Much cheaper than N HTTP
+ * round-trips when callers need a lot of files' content (e.g. a
+ * Thesys "list all unread articles" view building an index).
+ *
+ * Body:
+ *   paths:            string[]   — required, up to MAX_BULK entries
+ *   frontmatterOnly:  boolean    — if true, return only the YAML
+ *                                  frontmatter block ("---\n...\n---"),
+ *                                  not the full body. Large wins on
+ *                                  long notes. Defaults to false.
+ *   format:           "utf-8" | "base64" — mirrors GET /files/*
+ *
+ * Response:
+ *   { count, results: [{ path, content?, contentBase64?, size, modified } | { path, error }] }
+ */
+app.post("/bulk/read", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  if (!Array.isArray(body.paths)) return c.json({ error: "paths array required" }, 400);
+  if (body.paths.length > MAX_BULK) return c.json({ error: `max ${MAX_BULK} paths per request` }, 400);
+  const frontmatterOnly = body.frontmatterOnly === true;
+  const format = body.format === "base64" ? "base64" : "utf-8";
+
+  const results = await Promise.all(
+    body.paths.map(async (p: unknown) => {
+      if (typeof p !== "string") return { path: String(p), error: "invalid path" };
+      const abs = resolvePath(p);
+      if (!abs) return { path: p, error: "invalid path" };
+      if (!fs.existsSync(abs)) return { path: p, error: "not found" };
+      try {
+        const stat = fs.statSync(abs);
+        if (stat.isDirectory()) return { path: p, error: "is a directory" };
+
+        if (format === "base64") {
+          // base64 + frontmatterOnly is a weird combo; we just read the
+          // full bytes — frontmatterOnly only makes sense for utf-8.
+          const buf = fs.readFileSync(abs);
+          return {
+            path: p,
+            contentBase64: buf.toString("base64"),
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+          };
+        }
+
+        const full = fs.readFileSync(abs, "utf-8");
+        const content = frontmatterOnly ? sliceFrontmatter(full) : full;
+        return {
+          path: p,
+          content,
+          size: stat.size,
+          modified: stat.mtime.toISOString(),
+        };
+      } catch (e: any) {
+        return { path: p, error: e.message };
+      }
+    }),
+  );
+
+  return c.json({ count: results.length, results });
+});
+
+/**
+ * Extract just the YAML frontmatter block (including the fences) from
+ * a markdown file. Returns empty string if the file has no frontmatter.
+ * Matches Obsidian's own convention: `---\n` at the very start, closing
+ * `\n---` on its own line.
+ */
+function sliceFrontmatter(full: string): string {
+  if (!full.startsWith("---\n")) return "";
+  const end = full.indexOf("\n---", 4);
+  if (end === -1) return "";
+  return full.slice(0, end + 4);
+}
+
 // ── Start ────────────────────────────────────────────────────────
 
 console.log(`obsidian-api listening on :${PORT}, vault: ${VAULT_PATH}`);
