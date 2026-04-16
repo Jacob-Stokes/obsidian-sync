@@ -204,6 +204,206 @@ app.delete("/files/*", (c) => {
   return c.json({ path: rel, deleted: true });
 });
 
+/**
+ * PATCH /frontmatter/* — merge the given fields into the file's YAML
+ * frontmatter block, preserving everything else (unknown fields, the
+ * note body, quoting style, field order).
+ *
+ * Body: { fields: { [key]: string | number | boolean | null } }
+ *   - Scalar values only. null means "delete this field".
+ *   - To set an array or nested object, use PUT /files/* instead.
+ *
+ * If the file has no frontmatter block yet, one is prepended.
+ *
+ * This is safer than fetching the whole file, modifying, and PUTting
+ * back — it's a single atomic read-modify-write on the server.
+ */
+app.patch("/frontmatter/*", async (c) => {
+  const rel = decodeSplat(c, "/frontmatter");
+  const resolved = resolvePath(rel);
+  if (!resolved) return c.json({ error: "Invalid path" }, 400);
+  if (!fs.existsSync(resolved)) return c.json({ error: "File not found" }, 404);
+
+  const body = await c.req.json().catch(() => ({}));
+  if (!body || typeof body.fields !== "object" || body.fields === null) {
+    return c.json({ error: "fields object required" }, 400);
+  }
+  const patch = body.fields as Record<string, unknown>;
+  for (const [k, v] of Object.entries(patch)) {
+    if (
+      v !== null &&
+      typeof v !== "string" &&
+      typeof v !== "number" &&
+      typeof v !== "boolean"
+    ) {
+      return c.json({ error: `field ${k} must be scalar or null` }, 400);
+    }
+  }
+
+  const original = fs.readFileSync(resolved, "utf-8");
+  const updated = mergeFrontmatter(original, patch);
+  fs.writeFileSync(resolved, updated, "utf-8");
+  const stat = fs.statSync(resolved);
+  return c.json({ path: rel, written: true, size: stat.size });
+});
+
+/**
+ * Same as PATCH /frontmatter/* but for N files in one request.
+ *
+ * Body: { patches: [{ path, fields }, ...] }
+ */
+app.post("/bulk/frontmatter", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  if (!Array.isArray(body.patches)) return c.json({ error: "patches array required" }, 400);
+  if (body.patches.length > MAX_BULK) return c.json({ error: `max ${MAX_BULK} patches per request` }, 400);
+
+  const results = await Promise.all(
+    body.patches.map(async (p: unknown) => {
+      if (!p || typeof p !== "object") return { path: String(p), error: "invalid patch" };
+      const rec = p as Record<string, unknown>;
+      const path_ = typeof rec.path === "string" ? rec.path : "";
+      if (!path_) return { path: path_, error: "path required" };
+      const fields = rec.fields as Record<string, unknown> | undefined;
+      if (!fields || typeof fields !== "object") return { path: path_, error: "fields object required" };
+      for (const [k, v] of Object.entries(fields)) {
+        if (
+          v !== null &&
+          typeof v !== "string" &&
+          typeof v !== "number" &&
+          typeof v !== "boolean"
+        ) {
+          return { path: path_, error: `field ${k} must be scalar or null` };
+        }
+      }
+      const abs = resolvePath(path_);
+      if (!abs) return { path: path_, error: "invalid path" };
+      if (!fs.existsSync(abs)) return { path: path_, error: "not found" };
+      try {
+        const original = fs.readFileSync(abs, "utf-8");
+        const updated = mergeFrontmatter(original, fields);
+        fs.writeFileSync(abs, updated, "utf-8");
+        return { path: path_, written: true };
+      } catch (e: any) {
+        return { path: path_, error: e.message };
+      }
+    }),
+  );
+
+  const ok = results.filter((r) => r.written).length;
+  return c.json({ count: results.length, written: ok, results });
+});
+
+/**
+ * Merge a scalar patch into an existing markdown file's YAML
+ * frontmatter. Preserves field order, quoting style, surrounding
+ * body. Hand-rolled — no YAML parser dependency.
+ *
+ * Rules:
+ *   - If the frontmatter block exists, each patch key replaces the
+ *     existing value line (or is appended before `---` if missing).
+ *   - If the file has no frontmatter, one is prepended.
+ *   - null patch value removes the field.
+ *   - Quoting: booleans/numbers unquoted, strings quoted with " if
+ *     they'd otherwise be ambiguous (contains : # [ ] { } , or
+ *     starts/ends with whitespace).
+ */
+function mergeFrontmatter(original: string, patch: Record<string, unknown>): string {
+  const fenceStart = "---\n";
+  const closingFence = "\n---";
+
+  let fmBlock: string; // everything between the opening ---\n and the closing \n---
+  let rest: string;    // everything after the closing fence (incl. the trailing \n)
+  let hadFrontmatter: boolean;
+
+  if (original.startsWith(fenceStart)) {
+    const end = original.indexOf(closingFence, fenceStart.length);
+    if (end === -1) {
+      // Malformed: treat as no frontmatter.
+      hadFrontmatter = false;
+      fmBlock = "";
+      rest = original;
+    } else {
+      hadFrontmatter = true;
+      fmBlock = original.slice(fenceStart.length, end);
+      rest = original.slice(end + closingFence.length);
+    }
+  } else {
+    hadFrontmatter = false;
+    fmBlock = "";
+    rest = original;
+  }
+
+  const lines = fmBlock.length > 0 ? fmBlock.split("\n") : [];
+
+  for (const [key, value] of Object.entries(patch)) {
+    const { start, end } = findKeyBlock(lines, key);
+    if (value === null) {
+      if (start !== -1) lines.splice(start, end - start + 1);
+      continue;
+    }
+    const formatted = `${key}: ${formatScalar(value as string | number | boolean)}`;
+    if (start === -1) {
+      lines.push(formatted);
+    } else {
+      // Replace the existing block (which might be multi-line for
+      // lists) with a single scalar line. We only ever patch scalars,
+      // so this is correct.
+      lines.splice(start, end - start + 1, formatted);
+    }
+  }
+
+  const newBlock = lines.join("\n");
+  if (!hadFrontmatter) {
+    return `${fenceStart}${newBlock}\n---\n${rest.startsWith("\n") ? rest.slice(1) : rest}`;
+  }
+  return `${fenceStart}${newBlock}${closingFence}${rest}`;
+}
+
+/**
+ * Find the line range [start, end] inclusive that makes up the entry
+ * for `key` in a frontmatter block. Handles both scalar (single line)
+ * and list (multi-line with `  - item` continuations) forms. Returns
+ * {start:-1, end:-1} if not found.
+ */
+function findKeyBlock(lines: string[], key: string): { start: number; end: number } {
+  const keyRe = new RegExp(`^${escapeRegex(key)}:\\s*(.*)$`);
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(keyRe);
+    if (!m) continue;
+    // If the scalar after `:` is empty, we might be starting a list —
+    // consume subsequent `  -` continuation lines.
+    let end = i;
+    if ((m[1] ?? "").trim() === "") {
+      while (end + 1 < lines.length && /^\s{2,}-\s/.test(lines[end + 1])) {
+        end++;
+      }
+    }
+    return { start: i, end };
+  }
+  return { start: -1, end: -1 };
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatScalar(v: string | number | boolean): string {
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number") return String(v);
+  // String — quote if it could be ambiguous or contains control chars.
+  const needsQuotes =
+    /[:#\[\]\{\},&*!|>'"`%@]/.test(v) ||
+    /^\s|\s$/.test(v) ||
+    v === "" ||
+    v === "true" ||
+    v === "false" ||
+    v === "null" ||
+    /^-?\d/.test(v);
+  if (!needsQuotes) return v;
+  // Double-quoted, escape backslashes and double quotes.
+  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 // ── Folders ───────────────────────────────────────────────────────
 
 app.get("/folders", (c) => {
